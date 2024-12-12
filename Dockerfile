@@ -19,4 +19,5 @@ RUN conda env create -f environment.yml
 SHELL ["conda", "run", "-n", "backend-api", "/bin/bash", "-c"]
 
 # The code to run when container is started
-ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "backend-api", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "backend-api", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT [ "conda", "run", "--no-capture-output", "-n", "backend-api", "debugpy", "--listen", "0.0.0.0:5678", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000" ]
