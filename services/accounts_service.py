@@ -241,10 +241,11 @@ class AccountsService:
                         if "USD" in token:
                             price = Decimal("1")
                         else:
-                            price = Decimal(last_traded_prices.get(pos["symbol"], 0))
+                            market = self.get_default_market(balance["token"])
+                            price = Decimal(last_traded_prices.get(market, 0))
                         tokens_info.append(
                             {
-                                "token": balance["token"].split("USD")[0],
+                                "token": balance["token"],
                                 "units": float(balance["units"]),
                                 "price": float(price),
                                 "value": float(price * balance["units"]),
@@ -266,22 +267,18 @@ class AccountsService:
                             connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key
                         )
                         positions = client.futures_position_information()
-                        tokens = [d.get("symbol") for d in positions]
-                        # unique_tokens = [balance["token"] for balance in balances]
-
-                        last_traded_prices = await self._safe_get_last_traded_prices(connector, trading_pairs)
+                        last_traded_prices = await self._safe_get_last_traded_prices(
+                            connector, [pos["symbol"].replace("USD", "-USD") for pos in positions]
+                        )
 
                         for pos in positions:
                             to_correct = 0
-                            # if pos['symbol'] in tokens:
-                            # to_correct = balances[]
                             for b in balances:
                                 if pos["symbol"] in b["token"]:
                                     to_correct = b["units"]
                             to_correct -= Decimal(pos["positionAmt"])
-                            # tokens_info[-1]
                             ti = next((d for d in tokens_info if d["token"] == pos["symbol"]), None)
-                            price = Decimal(last_traded_prices.get(pos["symbol"], 0))
+                            price = Decimal(last_traded_prices.get(pos["symbol"].replace("USD", "-USD"), 0))
                             if ti is None:
                                 tokens_info.append(
                                     {
