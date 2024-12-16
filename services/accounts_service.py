@@ -16,6 +16,11 @@ from utils.file_system import FileSystemUtil
 from utils.models import BackendAPIConfigAdapter
 from utils.security import BackendAPISecurity
 
+import os
+import binance
+import yaml
+import argparse
+
 file_system = FileSystemUtil()
 
 
@@ -26,18 +31,20 @@ class AccountsService:
     update the balances of each account.
     """
 
-    def __init__(self,
-                 update_account_state_interval_minutes: int = 1,
-                 default_quote: str = "USDT",
-                 account_history_file: str = "account_state_history.json",
-                 account_history_dump_interval_minutes: int = 1):
+    def __init__(
+        self,
+        update_account_state_interval_seconds: int = 60,
+        default_quote: str = "USDT",
+        account_history_file: str = "account_state_history.json",
+        account_history_dump_interval_minutes: int = 1,
+    ):
         # TODO: Add database to store the balances of each account each time it is updated.
         self.secrets_manager = ETHKeyFileSecretManger(CONFIG_PASSWORD)
         self.accounts = {}
         self.accounts_state = {}
         self.account_state_update_event = asyncio.Event()
         self.initialize_accounts()
-        self.update_account_state_interval = update_account_state_interval_minutes * 60
+        self.update_account_state_interval = update_account_state_interval_seconds
         self.default_quote = default_quote
         self.history_file = account_history_file
         self.account_history_dump_interval = account_history_dump_interval_minutes
@@ -99,10 +106,8 @@ class AccountsService:
                 logging.error(f"Error dumping account state: {e}")
             finally:
                 now = datetime.now()
-                next_log_time = (now + timedelta(minutes=self.account_history_dump_interval)).replace(second=0,
-                                                                                                      microsecond=0)
-                next_log_time = next_log_time - timedelta(
-                    minutes=next_log_time.minute % self.account_history_dump_interval)
+                next_log_time = (now + timedelta(minutes=self.account_history_dump_interval)).replace(second=0, microsecond=0)
+                next_log_time = next_log_time - timedelta(minutes=next_log_time.minute % self.account_history_dump_interval)
                 sleep_duration = (next_log_time - now).total_seconds()
                 await asyncio.sleep(sleep_duration)
 
@@ -223,8 +228,11 @@ class AccountsService:
             for connector_name, connector in connectors.items():
                 tokens_info = []
                 try:
-                    balances = [{"token": key, "units": value} for key, value in connector.get_all_balances().items() if
-                                value != Decimal("0") and key not in BANNED_TOKENS]
+                    balances = [
+                        {"token": key, "units": value}
+                        for key, value in connector.get_all_balances().items()
+                        if value != Decimal("0") and key not in BANNED_TOKENS
+                    ]
                     unique_tokens = [balance["token"] for balance in balances]
                     trading_pairs = [self.get_default_market(token) for token in unique_tokens if "USD" not in token]
                     last_traded_prices = await self._safe_get_last_traded_prices(connector, trading_pairs)
@@ -233,19 +241,72 @@ class AccountsService:
                         if "USD" in token:
                             price = Decimal("1")
                         else:
-                            market = self.get_default_market(balance["token"])
-                            price = Decimal(last_traded_prices.get(market, 0))
-                        tokens_info.append({
-                            "token": balance["token"],
-                            "units": float(balance["units"]),
-                            "price": float(price),
-                            "value": float(price * balance["units"]),
-                            "available_units": float(connector.get_available_balance(balance["token"]))
-                        })
+                            price = Decimal(last_traded_prices.get(pos["symbol"], 0))
+                        tokens_info.append(
+                            {
+                                "token": balance["token"].split("USD")[0],
+                                "units": float(balance["units"]),
+                                "price": float(price),
+                                "value": float(price * balance["units"]),
+                                "available_units": float(connector.get_available_balance(balance["token"])),
+                            }
+                        )
                     self.account_state_update_event.set()
                 except Exception as e:
-                    logging.error(
-                        f"Error updating balances for connector {connector_name} in account {account_name}: {e}")
+                    logging.error(f"Error updating balances for connector {connector_name} in account {account_name}: {e}")
+                if "binance_perpetual" in connector_name:
+                    try:
+                        balances = [
+                            {"token": key, "units": value}
+                            for key, value in connector.account_positions.items()
+                            if value != Decimal("0") and key not in BANNED_TOKENS
+                        ]
+
+                        client = binance.client.Client(
+                            connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key
+                        )
+                        positions = client.futures_position_information()
+                        tokens = [d.get("symbol") for d in positions]
+                        # unique_tokens = [balance["token"] for balance in balances]
+
+                        last_traded_prices = await self._safe_get_last_traded_prices(connector, trading_pairs)
+
+                        for pos in positions:
+                            to_correct = 0
+                            # if pos['symbol'] in tokens:
+                            # to_correct = balances[]
+                            for b in balances:
+                                if pos["symbol"] in b["token"]:
+                                    to_correct = b["units"]
+                            to_correct -= Decimal(pos["positionAmt"])
+                            # tokens_info[-1]
+                            ti = next((d for d in tokens_info if d["token"] == pos["symbol"]), None)
+                            price = Decimal(last_traded_prices.get(pos["symbol"], 0))
+                            if ti is None:
+                                tokens_info.append(
+                                    {
+                                        "token": pos["symbol"],
+                                        "hb_pos": 0,
+                                        "actual_pos": pos["positionAmt"],
+                                        "to_correct": float(to_correct),
+                                        "price": float(price),
+                                        "hb_value": 0,
+                                        "actual_value": float(price * Decimal(pos["positionAmt"])),
+                                        "to_correct_value": float(price * to_correct),
+                                    }
+                                )
+                            else:
+                                ti["hb_pos"] = b["units"]
+                                ti["actual_pos"] = pos["positionAmt"]
+                                ti["to_correct"] = float(to_correct)
+                                ti["hb_value"] = 0
+                                ti["actual_value"] = float(price * Decimal(pos["positionAmt"]))
+                                ti["to_correct_value"] = float(price * to_correct)
+
+                        self.account_state_update_event.set()
+
+                    except Exception as e:
+                        logging.error(f"Error updating positions for connector {connector_name} in account {account_name}: {e}")
                 self.accounts_state[account_name][connector_name] = tokens_info
 
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=5):
@@ -312,7 +373,7 @@ class AccountsService:
         List all the accounts that are connected to the trading system.
         :return: List of accounts.
         """
-        return file_system.list_folders('credentials')
+        return file_system.list_folders("credentials")
 
     def list_credentials(self, account_name: str):
         """
@@ -321,8 +382,7 @@ class AccountsService:
         :return: List of credentials.
         """
         try:
-            return [file for file in file_system.list_files(f'credentials/{account_name}/connectors') if
-                    file.endswith('.yml')]
+            return [file for file in file_system.list_files(f"credentials/{account_name}/connectors") if file.endswith(".yml")]
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -349,8 +409,8 @@ class AccountsService:
         if account_name in self.accounts:
             raise HTTPException(status_code=400, detail="Account already exists.")
         files_to_copy = ["conf_client.yml", "conf_fee_overrides.yml", "hummingbot_logs.yml", ".password_verification"]
-        file_system.create_folder('credentials', account_name)
-        file_system.create_folder(f'credentials/{account_name}', "connectors")
+        file_system.create_folder("credentials", account_name)
+        file_system.create_folder(f"credentials/{account_name}", "connectors")
         for file in files_to_copy:
             file_system.copy_file(f"credentials/master_account/{file}", f"credentials/{account_name}/{file}")
         self.accounts[account_name] = {}
@@ -362,6 +422,6 @@ class AccountsService:
         :param account_name:
         :return:
         """
-        file_system.delete_folder('credentials', account_name)
+        file_system.delete_folder("credentials", account_name)
         self.accounts.pop(account_name)
         self.accounts_state.pop(account_name)
