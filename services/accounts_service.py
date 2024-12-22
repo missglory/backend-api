@@ -21,8 +21,14 @@ import binance
 import yaml
 import argparse
 
+import psycopg2
+
 file_system = FileSystemUtil()
 
+db_name = "db"
+db_username = "postgres"
+db_password = "postgres"
+db_host = "localhost"
 
 class AccountsService:
     """
@@ -50,6 +56,87 @@ class AccountsService:
         self.account_history_dump_interval = account_history_dump_interval_minutes
         self._update_account_state_task: Optional[asyncio.Task] = None
         self._dump_account_state_task: Optional[asyncio.Task] = None
+        self.conn = None
+        self.create_hypertable()
+        connector = self.accounts["master_account"]["binance_perpetual"]
+        self.client = binance.client.Client(connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key)
+
+    def create_hypertable(self):
+        # client_conf = file_system.read_yaml_file('credentials/master_account/conf_client.yml')
+        self.conn = psycopg2.connect(dbname=db_name, user=db_username, host=db_host, password=db_password)
+        cur = self.conn.cursor()
+        create_query = """
+            CREATE TABLE IF NOT EXISTS balances (
+                time TIMESTAMPTZ NOT NULL,
+                balance FLOAT,
+                pos FLOAT,
+                pos_conf FLOAT
+            );
+            
+            -- Create the hypertable with TimescaleDB if not already created
+            SELECT create_hypertable('balances', 'time', if_not_exists => TRUE);
+        """
+        try:
+            cur.execute(create_query)
+            self.conn.commit()
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.error(error)
+
+    def get_saved_state_and_sum_amounts(self):
+        cur = self.conn.cursor()
+        query = """
+            SELECT saved_state FROM "MarketState" WHERE market = 'binance_perpetual';
+        """
+        try:
+            cur.execute(query)
+            result = cur.fetchone()
+
+            if result:
+                self.saved_state = result[0]
+                # Assuming saved_state is a JSON object
+                # json_saved_state = json.loads(saved_state)
+                # Initialize sum of amounts for closed positions
+                sum_amounts = 0.0
+                for position_id, position in self.saved_state.items():
+                    # Assuming 'last_state' indicates the state of the position (1 for open, other values for close)
+                    # if position['last_state'] != "1":  # Adjust this condition based on actual logic to determine closed positions
+                    if position["position"] == "CLOSE":
+                        mult = 1
+                        if position["trade_type"] == "BUY":
+                            mult = -1
+                        amount = mult * (float(position["amount"]) - float(
+                            position["executed_amount_base"])
+                        )  # Use the appropriate field here
+                        sum_amounts += amount
+                    elif position["position"] == "OPEN":
+                        mult = 1
+                        if position["trade_type"] == "SELL":
+                            mult = -1
+                        amount = mult * float(position["executed_amount_base"])
+                        sum_amounts += amount
+
+                return sum_amounts
+
+            else:
+                logging.error("No saved state found for market 'binance_perpetual'.")
+                return None
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.error(error)
+
+    def insert_balances(self, balance, pos):
+        cur = self.conn.cursor()
+        insert_query = """
+            INSERT INTO balances (time, balance, pos, pos_conf)
+            VALUES (%s, %s, %s, %s);
+        """
+        time = datetime.now().strftime("%Y-%m-%d %H:%M:%S%z")
+        value2 = self.get_saved_state_and_sum_amounts()
+        try:
+            cur.execute(insert_query, (time, balance, pos, value2))
+            # self.conn.commit()
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.error(error)
 
     def get_accounts_state(self):
         return self.accounts_state
@@ -116,8 +203,9 @@ class AccountsService:
         Dump the current account state to a JSON file. Create it if the file not exists.
         :return:
         """
+        self.conn.commit()
         timestamp = datetime.now().isoformat()
-        state_to_dump = {"timestamp": timestamp, "state": self.accounts_state}
+        state_to_dump = {"time": timestamp, "state": self.accounts_state}
         if not file_system.path_exists(path=f"data/{self.history_file}"):
             file_system.add_file(directory="data", file_name=self.history_file, content=json.dumps(state_to_dump) + "\n")
         else:
@@ -259,46 +347,54 @@ class AccountsService:
                     try:
                         balances = [
                             {"token": key, "units": value}
-                            for key, value in connector.account_positions.items()
+                            for key, value in connector.get_all_balances().items()
                             if value != Decimal("0") and key not in BANNED_TOKENS
                         ]
 
-                        client = binance.client.Client(
-                            connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key
-                        )
-                        positions = client.futures_position_information()
+                        positions = self.client.futures_position_information()
                         last_traded_prices = await self._safe_get_last_traded_prices(
                             connector, [pos["symbol"].replace("USD", "-USD") for pos in positions]
                         )
 
                         for pos in positions:
-                            to_correct = 0
+                            to_correct = Decimal(self.get_saved_state_and_sum_amounts())
+                            balance = 0
                             for b in balances:
-                                if pos["symbol"] in b["token"]:
-                                    to_correct = b["units"]
+                                if b["token"] == "USDT":
+                                    balance = float(b["units"])
                             to_correct -= Decimal(pos["positionAmt"])
-                            ti = next((d for d in tokens_info if d["token"] == pos["symbol"]), None)
+
+                            self.insert_balances(balance, pos["positionAmt"])
+
                             price = Decimal(last_traded_prices.get(pos["symbol"].replace("USD", "-USD"), 0))
+                            _mult = Decimal(2)
+                            if abs(to_correct) * price > Decimal(10) * _mult:
+                                self.client.futures_create_order(
+                                    symbol="DOGEUSDT",
+                                    side="SELL" if to_correct < 0 else "BUY",
+                                    type="MARKET",
+                                    quantity=abs(int(to_correct / _mult)),
+                                )
+
+                            ti = next((d for d in tokens_info if d["token"] == pos["symbol"]), None)
                             if ti is None:
                                 tokens_info.append(
                                     {
                                         "token": pos["symbol"],
-                                        "hb_pos": 0,
                                         "actual_pos": pos["positionAmt"],
                                         "to_correct": float(to_correct),
                                         "price": float(price),
-                                        "hb_value": 0,
                                         "actual_value": float(price * Decimal(pos["positionAmt"])),
                                         "to_correct_value": float(price * to_correct),
+                                        "saved_state": self.saved_state,
                                     }
                                 )
                             else:
-                                ti["hb_pos"] = b["units"]
                                 ti["actual_pos"] = pos["positionAmt"]
                                 ti["to_correct"] = float(to_correct)
-                                ti["hb_value"] = 0
                                 ti["actual_value"] = float(price * Decimal(pos["positionAmt"]))
                                 ti["to_correct_value"] = float(price * to_correct)
+                                ti["saved_state"] = self.saved_state
 
                         self.account_state_update_event.set()
 
