@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
+from utils.example_utils import setup
+from hyperliquid.utils import constants
+
 from fastapi import HTTPException
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
@@ -29,6 +32,7 @@ db_name = "db"
 db_username = "postgres"
 db_password = "postgres"
 db_host = "localhost"
+
 
 class AccountsService:
     """
@@ -58,8 +62,10 @@ class AccountsService:
         self._dump_account_state_task: Optional[asyncio.Task] = None
         self.conn = None
         self.create_hypertable()
-        connector = self.accounts["master_account"]["binance_perpetual"]
-        self.client = binance.client.Client(connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key)
+        self.conf = {}
+        
+        self.hl_address, self.hl_info, exch = setup(conf=self.conf, base_url=constants.MAINNET_API_URL, skip_ws=True)
+        # binance.client.Client(connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key)
 
     def create_hypertable(self):
         # client_conf = file_system.read_yaml_file('credentials/master_account/conf_client.yml')
@@ -68,6 +74,7 @@ class AccountsService:
         create_query = """
             CREATE TABLE IF NOT EXISTS balances (
                 time TIMESTAMPTZ NOT NULL,
+                market TEXT,
                 balance FLOAT,
                 pos FLOAT,
                 pos_conf FLOAT
@@ -82,10 +89,10 @@ class AccountsService:
         except (Exception, psycopg2.DatabaseError) as error:
             logging.error(error)
 
-    def get_saved_state_and_sum_amounts(self):
+    def get_saved_state_and_sum_amounts(self, market):
         cur = self.conn.cursor()
-        query = """
-            SELECT saved_state FROM "MarketState" WHERE market = 'binance_perpetual';
+        query = f"""
+            SELECT saved_state FROM "MarketState" WHERE market='{market}';
         """
         try:
             cur.execute(query)
@@ -95,6 +102,7 @@ class AccountsService:
                 self.saved_state = result[0]
                 # Assuming saved_state is a JSON object
                 # json_saved_state = json.loads(saved_state)
+
                 # Initialize sum of amounts for closed positions
                 sum_amounts = 0.0
                 for position_id, position in self.saved_state.items():
@@ -124,17 +132,17 @@ class AccountsService:
         except (Exception, psycopg2.DatabaseError) as error:
             logging.error(error)
 
-    def insert_balances(self, balance, pos):
+    def insert_balances(self, market, balance, pos):
         cur = self.conn.cursor()
         insert_query = """
-            INSERT INTO balances (time, balance, pos, pos_conf)
+            INSERT INTO balances (time, market, balance, pos, pos_conf)
             VALUES (%s, %s, %s, %s);
         """
         time = datetime.now().strftime("%Y-%m-%d %H:%M:%S%z")
-        value2 = self.get_saved_state_and_sum_amounts()
+        value2 = self.get_saved_state_and_sum_amounts(market)
         try:
-            cur.execute(insert_query, (time, balance, pos, value2))
-            # self.conn.commit()
+            cur.execute(insert_query, (time, market, balance, pos, value2))
+            self.conn.commit()
         except (Exception, psycopg2.DatabaseError) as error:
             logging.error(error)
 
@@ -343,7 +351,7 @@ class AccountsService:
                     self.account_state_update_event.set()
                 except Exception as e:
                     logging.error(f"Error updating balances for connector {connector_name} in account {account_name}: {e}")
-                if "binance_perpetual" in connector_name:
+                if  connector_name in ["binance_perpetual",'hyperliquid_perpetual']:
                     try:
                         balances = [
                             {"token": key, "units": value}
@@ -351,50 +359,116 @@ class AccountsService:
                             if value != Decimal("0") and key not in BANNED_TOKENS
                         ]
 
-                        positions = self.client.futures_position_information()
+                        if connector_name == "binance_perpetual": 
+                            self.client = binance.client.Client(connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key)
+                            positions = self.client.futures_position_information()
+                        elif connector_name == "hyperliquid_perpetual":
+                            # candles_info = info.candles_snapshot(
+                            #     symbol,
+                            #     "1h",
+                            #     1738357200000,
+                            #     1740690000000
+                            #     )
+
+                            # Get the user state and print out position information
+                            user_state = self.hl_info.user_state(self.hl_address)
+                            positions = []
+                            for position in user_state["assetPositions"]:
+                                positions.append(position["position"])
+                            if len(positions) > 0:
+                                print("positions:")
+                                for position in positions:
+                                    print(json.dumps(position, indent=2))
+                            else:
+                                print("no open positions")
+                            # columns = ['T', 'o', 'h', 'l', 'c']
+                            # candles = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+                            # df = pd.DataFrame(candles_info, columns=columns)
+                            # self.client = binance.client.Client(connector.binance_perpetual_api_key, connector.binance_perpetual_secret_key)
+                        # positions = self.client.futures_position_information()
                         last_traded_prices = await self._safe_get_last_traded_prices(
                             connector, [pos["symbol"].replace("USD", "-USD") for pos in positions]
                         )
 
+                        for token in tokens_info:
+                            # if "USD" in token["token"]:
+                                # continue
+                            positions.append(token)
                         for pos in positions:
-                            to_correct = Decimal(self.get_saved_state_and_sum_amounts())
+                            to_correct = Decimal(self.get_saved_state_and_sum_amounts(connector_name))
                             balance = 0
-                            for b in balances:
-                                if b["token"] == "USDT":
-                                    balance = float(b["units"])
-                            to_correct -= Decimal(pos["positionAmt"])
+                            # for b in balances:
+                                # if "USD" in b["token"]:
+                                    # balance = float(b["units"])
 
-                            self.insert_balances(balance, pos["positionAmt"])
+                            if connector_name == "binance_perpetual":
+                                self.insert_balances(connector_name, balance, pos.get("positionAmt", 0))
+                                to_correct -= Decimal(pos.get("positionAmt", 0.0))
+                                ti = next((d for d in tokens_info if d["token"] == pos["symbol"]), None)
+                                if ti is None:
+                                    tokens_info.append(
+                                        {
+                                            "token": pos["symbol"],
+                                            "actual_pos": pos["positionAmt"],
+                                            "to_correct": float(to_correct),
+                                            "price": float(price),
+                                            "actual_value": float(price * Decimal(pos["positionAmt"])),
+                                            "to_correct_value": float(price * to_correct),
+                                            "saved_state": self.saved_state,
+                                        }
+                                    )
+                                else:
+                                    ti["actual_pos"] = pos["positionAmt"]
+                                    ti["to_correct"] = float(to_correct)
+                                    ti["actual_value"] = float(price * Decimal(pos["positionAmt"]))
+                                    ti["to_correct_value"] = float(price * to_correct)
+                                    ti["saved_state"] = self.saved_state
+                                    
+                                    
+                            elif connector_name == "hyperliquid_perpetual":
+                                ti = next((d for d in tokens_info if d["token"] == pos["token"]), None)
+                                if ti is None:
+                                    tokens_info.append(
+                                        {
+                                            "token": pos["token"],
+                                            # "actual_pos": pos["positionAmt"],
+                                            "to_correct": float(to_correct),
+                                            "price": float(price),
+                                            # "actual_value": float(price * Decimal(pos[""])),
+                                            # "to_correct_value": float(price * to_correct),
+                                            "saved_state": self.saved_state,
+                                        }
+                                    )
+                                else:
+                                    self.insert_balances(connector_name, balance, float(pos.get("szi", 0.0)) * float(pos.get("entryPx", 0.0)))
+                                    to_correct -= Decimal(float(pos.get("szi", 0.0)) * float(pos.get("entryPx", 0.0)))
+                                    # ti["actual_pos"] = pos["positionAmt"] * Decimal(float(pos.get("szi", 0.0)) * float(pos.get("entryPx", 0.0)))
+                                    ti["to_correct_value"] = float(price * to_correct)
+                                    ti["to_correct"] = float(to_correct)
+                                    ti["actual_value"] = float(price * Decimal(float(pos.get("szi", 0.0)) * float(pos.get("entryPx", 0.0))))
+                                    ti["to_correct_value"] = float(price * to_correct)
+                                    ti["saved_state"] = self.saved_state
 
-                            price = Decimal(last_traded_prices.get(pos["symbol"].replace("USD", "-USD"), 0))
-                            _mult = Decimal(2)
-                            if abs(to_correct) * price > Decimal(10) * _mult:
-                                self.client.futures_create_order(
-                                    symbol="DOGEUSDT",
-                                    side="SELL" if to_correct < 0 else "BUY",
-                                    type="MARKET",
-                                    quantity=abs(int(to_correct / _mult)),
-                                )
-
-                            ti = next((d for d in tokens_info if d["token"] == pos["symbol"]), None)
-                            if ti is None:
-                                tokens_info.append(
-                                    {
-                                        "token": pos["symbol"],
-                                        "actual_pos": pos["positionAmt"],
-                                        "to_correct": float(to_correct),
-                                        "price": float(price),
-                                        "actual_value": float(price * Decimal(pos["positionAmt"])),
-                                        "to_correct_value": float(price * to_correct),
-                                        "saved_state": self.saved_state,
-                                    }
-                                )
-                            else:
-                                ti["actual_pos"] = pos["positionAmt"]
-                                ti["to_correct"] = float(to_correct)
-                                ti["actual_value"] = float(price * Decimal(pos["positionAmt"]))
-                                ti["to_correct_value"] = float(price * to_correct)
-                                ti["saved_state"] = self.saved_state
+                            _mult = Decimal(3)
+                            if connector_name == "binance_perpetual":
+                                price = Decimal(last_traded_prices.get(pos["symbol"].replace("USD", "-USD"), 0))
+                                if abs(to_correct) * price > Decimal(10) * _mult:
+                                    self.client.futures_create_order(
+                                        symbol="DOGEUSDT",
+                                        side="SELL" if to_correct < 0 else "BUY",
+                                        type="MARKET",
+                                        quantity=abs(int(to_correct / _mult)),
+                                    )
+                                if connector_name == "hyperliquid_perpetual":
+                                    # price = Decimal(last_traded_prices.get(pos["symbol"].replace("USD", "-USD"), 0))
+                                    # if abs(to_correct) * price > Decimal(10) * _mult:
+                                    #     self.client.futures_create_order(
+                                    #         symbol="DOGEUSDT",
+                                    #         side="SELL" if to_correct < 0 else "BUY",
+                                    #         type="MARKET",
+                                    #         quantity=abs(int(to_correct / _mult)),
+                                    #     )                                   # self.
+                                    pass
 
                         self.account_state_update_event.set()
 
@@ -501,11 +575,11 @@ class AccountsService:
         """
         if account_name in self.accounts:
             raise HTTPException(status_code=400, detail="Account already exists.")
-        files_to_copy = ["conf_client.yml", "conf_fee_overrides.yml", "hummingbot_logs.yml", ".password_verification"]
+        # files_to_copy = ["conf_client.yml", "conf_fee_overrides.yml", "hummingbot_logs.yml", ".password_verification"]
         file_system.create_folder("credentials", account_name)
         file_system.create_folder(f"credentials/{account_name}", "connectors")
-        for file in files_to_copy:
-            file_system.copy_file(f"credentials/master_account/{file}", f"credentials/{account_name}/{file}")
+        # for file in files_to_copy:
+            # file_system.copy_file(f"credentials/master_account/{file}", f"credentials/{account_name}/{file}")
         self.accounts[account_name] = {}
         self.accounts_state[account_name] = {}
 
